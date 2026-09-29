@@ -1,0 +1,193 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  AGENT
+  VIEWER
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  PENDING
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum CommentVisibility {
+  PUBLIC
+  INTERNAL
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+model Tenant {
+  id        String    @id @default(cuid())
+  name      String
+  slug      String    @unique
+  createdAt DateTime  @default(now())
+  users     User[]
+  companies Company[]
+  customers Customer[]
+  tickets   Ticket[]
+  auditLogs AuditLog[]
+  outbox    OutboxEvent[]
+}
+
+model User {
+  id             String       @id @default(cuid())
+  tenantId       String
+  name           String
+  email          String
+  role           Role
+  active         Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  tenant         Tenant       @relation(fields: [tenantId], references: [id])
+  assignedTickets Ticket[]    @relation("TicketAssignee")
+  authoredComments TicketComment[]
+  auditLogs      AuditLog[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId, role])
+}
+
+model Company {
+  id        String     @id @default(cuid())
+  tenantId  String
+  name      String
+  domain    String?
+  plan      String     @default("standard")
+  createdAt DateTime   @default(now())
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  customers Customer[]
+
+  @@index([tenantId, name])
+}
+
+model Customer {
+  id        String    @id @default(cuid())
+  tenantId  String
+  companyId String?
+  name      String
+  email     String
+  phone     String?
+  createdAt DateTime  @default(now())
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+  company   Company?  @relation(fields: [companyId], references: [id])
+  tickets   Ticket[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId, name])
+}
+
+model Ticket {
+  id             String           @id @default(cuid())
+  tenantId       String
+  customerId     String
+  assignedUserId String?
+  number         Int
+  subject        String
+  description    String
+  status         TicketStatus     @default(NEW)
+  priority       TicketPriority   @default(NORMAL)
+  tags           String[]         @default([])
+  slaDueAt       DateTime?
+  firstResponseAt DateTime?
+  resolvedAt     DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  tenant         Tenant           @relation(fields: [tenantId], references: [id])
+  customer       Customer         @relation(fields: [customerId], references: [id])
+  assignedUser   User?            @relation("TicketAssignee", fields: [assignedUserId], references: [id])
+  comments       TicketComment[]
+  emailMessages  EmailMessage[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, priority])
+  @@index([tenantId, assignedUserId])
+  @@index([tenantId])
+  @@index([tags], type: Gin)
+}
+
+model TicketComment {
+  id         String            @id @default(cuid())
+  tenantId   String
+  ticketId   String
+  authorId   String
+  visibility CommentVisibility
+  body       String
+  createdAt  DateTime          @default(now())
+  ticket     Ticket            @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author     User              @relation(fields: [authorId], references: [id])
+
+  @@index([tenantId, ticketId, createdAt])
+}
+
+model EmailMessage {
+  id          String    @id @default(cuid())
+  tenantId    String
+  ticketId    String?
+  externalId  String
+  fromEmail   String
+  toEmail     String
+  subject     String
+  body        String
+  direction   String
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  ticket      Ticket?   @relation(fields: [ticketId], references: [id])
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId, direction, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  tenantId  String
+  actorId   String?
+  action    String
+  entity    String
+  entityId  String
+  metadata  Json
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  actor     User?    @relation(fields: [actorId], references: [id])
+
+  @@index([tenantId, entity, entityId])
+}
+
+model OutboxEvent {
+  id          String       @id @default(cuid())
+  tenantId    String
+  topic       String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  processedAt DateTime?
+  createdAt   DateTime     @default(now())
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([tenantId, topic])
+}
