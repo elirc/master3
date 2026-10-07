@@ -40,7 +40,7 @@ Important sections:
 
 - `listTickets` builds the query shape from validated filters.
 - `createTicket` uses a transaction to create the ticket, audit log, and outbox event.
-- `updateTicket` checks domain transitions and assignment permissions before writing.
+- `updateTicket` rejects non-operational roles with `canEditTicket` before any lookup, then checks domain transitions and assignment permissions before writing.
 - `addTicketComment` distinguishes public replies from internal notes and emits notification events for public replies.
 
 Senior concept: orchestration code coordinates rules, persistence, and side effects. It should be explicit and boring.

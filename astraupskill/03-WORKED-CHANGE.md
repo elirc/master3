@@ -1,77 +1,60 @@
 # Worked change: safe ticket PATCH
 
-## Two symptoms, one cause
+The "before" code is preserved in `snapshots/`. Diff it yourself against the current files; every claim below comes from that diff.
+
+```bash
+git diff --no-index astraupskill/snapshots/ticketService-before.ts.txt apps/api/src/modules/tickets/ticketService.ts
+git diff --no-index astraupskill/snapshots/domain-before.ts.txt packages/domain/src/index.ts
+git diff --no-index astraupskill/snapshots/ticket-rules-before.ts.txt tests/domain/ticket-rules.test.ts
+```
+
+`snapshots/ticketRoutes-before.ts.txt` is byte-identical to the current `ticketRoutes.ts`: the routes did not change, which is itself the lesson (the fix belongs in the service).
 
 ## Two symptoms, one cause
 
-## Two symptoms, one cause
+**Predict before you read on:** name the two symptoms; is the missing check in the route or the service?
 
-**Predict before you read on:** name the two symptoms before reading; is the missing check in the route or the service?
+In the snapshot, `updateTicket` opened with the tenant-scoped `findFirst`, and the only role-sensitive checks were conditional on fields:
 
-**Predict before you read on:** name the two symptoms before reading; is the missing check in the route or the service?
+- `status` present: `assertTicketTransition` refused a viewer, but by throwing a plain `Error`, so the client got a **500**, not a 403 (`packages/domain/src/index.ts:39-43`, `errors.ts:32-33`).
+- `assignedUserId` present: `canAssignTicket` gave a proper 403.
+- anything else (`priority`, `tags`, or `{}`): no check at all. A viewer could raise priority, and the write produced an audit row and an outbox event.
+
+The second symptom was the response. The snapshot's update used `include: ticketInclude`, whose comments have no visibility filter, while `getTicket` filtered inline. A viewer's harmless-looking PATCH returned internal notes that a viewer GET hid.
+
+One cause: the PATCH was treated as a bag of independently checked fields instead of one operation that needs authority and a shaped response.
 
 ## The role gate comes first
 
 **Predict before you read on:** why must the gate run before `findFirst` and not after?
-
-**Predict before you read on:** name the two symptoms before reading; is the missing check in the route or the service?
-
-## The role gate comes first
-
-## The response is shaped by role
-
-**Predict before you read on:** what changes for an agent, and what changes for a viewer, when `ticketInclude` becomes `ticketIncludeForRole`?
-
-**Predict before you read on:** why must the gate run before `findFirst` and not after?
-
-## Walk the three requests
-
-**Predict before you read on:** for viewer PATCH, agent PATCH and viewer GET, write the status code and the number of audit rows created.
-
-The defect has two visible symptoms. A viewer can send `PATCH /api/tickets/t1` with `{ "priority": "URGENT" }` because the service only checks role when `status` or `assignedUserId` is present. A viewer can also receive an internal comment because the update query includes the shared `ticketInclude`, while GET replaces its comments include with a public-only predicate. Both symptoms come from treating a partial update as a collection of independent fields instead of one authorized operation with a shaped response.
-
-## The role gate comes first
-
-## The response is shaped by role
-
-## What the patch leaves alone
-
-**Predict before you read on:** does `createTicket` get a role gate in this change? Why might that be deferred?
-
-**Predict before you read on:** what changes for an agent, and what changes for a viewer, when `ticketInclude` becomes `ticketIncludeForRole`?
-
-**Predict before you read on:** why must the gate run before `findFirst` and not after?
-
-## Walk the three requests
-
-**Predict before you read on:** for viewer PATCH, agent PATCH and viewer GET, write the status code and the number of audit rows created.
-
-The repair starts with a role gate:
 
 ```ts
+// ticketService.ts:172-174
 if (!canEditTicket(auth.role)) {
   throw new HttpError(403, "You do not have permission to update tickets");
 }
 ```
 
+Placed after the lookup, a viewer would still learn whether an id exists in their tenant (404 vs 403) and would cost a query. Placed first, every viewer PATCH is a 403 with zero database work. `canEditTicket` is new in the domain package (`index.ts:82-85`); `canAssignTicket` now delegates to it (`:78-80`) but keeps its name so assignment callers read correctly.
+
 ## The response is shaped by role
-
-## What the patch leaves alone
-
-**Predict before you read on:** does `createTicket` get a role gate in this change? Why might that be deferred?
 
 **Predict before you read on:** what changes for an agent, and what changes for a viewer, when `ticketInclude` becomes `ticketIncludeForRole`?
 
-It runs before `prisma.ticket.findFirst`. The service keeps its existing tenant-scoped lookup, transition check, assignee check, and serializable transaction. The route's Zod schema validates the priority enum before this service receives typed input; the service is not the priority parser. The update include changes from `ticketInclude` to `ticketIncludeForRole(auth.role)`. That helper keeps the customer and assigned-user projections but adds `where: visibleCommentWhere(role)` to comments. An agent therefore sees public and internal notes; a viewer cannot reach update, while viewer GET still sees public notes only.
+For an agent, nothing: `visibleCommentWhere("AGENT")` is `{}`. For a viewer, the update path is now unreachable, but the include is still role-aware, so if the gate is ever loosened (say, to let viewers tag tickets) the response stays safe. `ticketIncludeForRole` (`ticketService.ts:47-56`) replaced the inline filter in `getTicket` and the raw include in `updateTicket`, so the two paths cannot drift again.
+
+## What arrived in later passes
+
+The diff also shows changes that are not part of the PATCH repair: `withSerializableRetry` (`:14-31`), and `{ isolationLevel: Serializable }` on both the `createTicket` and `updateTicket` transactions (`:165`, `:236`). The snapshot's transactions used the default isolation level (Read Committed in PostgreSQL). Keep the two changes separate in your head: the gate and the include fix authorization; the isolation level and retry address concurrent writers, and only partly (02, "Serializable means retry").
 
 ## Walk the three requests
 
-**Predict before you read on:** for viewer PATCH, agent PATCH and viewer GET, write the status code and the number of audit rows created.
+**Predict before you read on:** for viewer PATCH, agent PATCH and viewer GET on seeded ticket #1001, write the status code and the number of audit rows created.
 
-Walk the viewer request. Auth resolves the viewer in tenant `acme-support`. Zod accepts the priority. `updateTicket` rejects the role before querying Prisma, so the result is 403. There is no updated ticket, audit row, or outbox event. Walk the agent request. Auth resolves `agent@acme.test`; the service loads the ticket in the same tenant, checks any supplied status or assignee rules, updates it in a transaction, creates `ticket.updated`, and returns 200. The response contains the agent-allowed comment set. Walk a viewer GET after that change: it still returns the ticket's public comment and omits the internal note.
+- Viewer `PATCH {"priority":"URGENT"}`: auth resolves `viewer@acme.test`; Zod accepts; `canEditTicket("VIEWER")` is false → 403. No lookup, no audit row, no outbox row.
+- Agent `PATCH {"priority":"URGENT"}`: tenant-scoped lookup finds the HIGH ticket; no status or assignee to check; transaction updates priority, recomputes `slaDueAt` from *now* because the priority changed (`:208-211`), inserts one audit row and one outbox row → 200 with both comments.
+- Viewer `GET`: 200 with the manager's public reply and without the agent's internal note (the seed creates one of each, `prisma/seed.ts:72-89`).
 
 ## What the patch leaves alone
 
-**Predict before you read on:** does `createTicket` get a role gate in this change? Why might that be deferred?
-
-The patch preserves status transition and assignment rules. `canAssignTicket` still governs assignee validation, while `canEditTicket` expresses the broader operational edit rule. `createTicket` has no new role gate in this change; its existing behavior is outside the PATCH defect. Demo header authentication remains intentionally bounded to local fixtures; production identity verification is a separate design.
+`createTicket` still has no role gate, so a viewer can open tickets through `POST /api/tickets` and through `POST /api/notifications/inbound-email`. `addTicketComment` still lets a viewer post a public reply. Invalid transitions by an operational role are still 500s. Whether those are bugs is a product decision; [06](06-SOLUTIONS-AND-REVIEW.md) argues the last one is.

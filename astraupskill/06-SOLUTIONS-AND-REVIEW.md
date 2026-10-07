@@ -1,58 +1,46 @@
 # Solutions and review
 
-Exercise 1 solution: `x-tenant-slug: acme-support` is resolved to the synthetic database id `tenant-a`, while `x-user-email: viewer@acme.test` resolves to an active user whose role is `VIEWER`. The body `{ priority: "URGENT" }` is valid at the route boundary. `updateTicket` then calls `canEditTicket("VIEWER")`, throws `HttpError(403, ...)`, and returns through the error middleware before `prisma.ticket.findFirst`. The same path applies to `{ tags: ["billing"] }` and `{}`. Because no lookup, transaction, ticket update, audit insert, or outbox insert is reached, each has zero durable side effects. This is a service authorization result, not a claim that the demo headers are production identity.
+## Exercise solutions
 
-Exercise 2 solution: the complete helper is:
+**Exercise 1.** The surprises are the AGENT rule and the viewer no-op. `canTransitionTicket` (`packages/domain/src/index.ts:32-37`) checks in order: same status → true; VIEWER → false; AGENT moving to CLOSED → only from RESOLVED or PENDING; otherwise the `allowedTransitions` table. So AGENT OPEN→CLOSED is false while MANAGER OPEN→CLOSED is true; AGENT PENDING→CLOSED is true; NEW→CLOSED and CLOSED→RESOLVED are not in the table for anyone; RESOLVED→PENDING is false. VIEWER OPEN→OPEN is **true** because the same-status shortcut runs before the viewer check (finding F8).
 
-```ts
-export function canEditTicket(role: ActorRole): boolean {
-  return role === "ADMIN" || role === "MANAGER" || role === "AGENT";
-}
-```
+**Exercise 2.** MET, AT_RISK, AT_RISK, BREACHED, PAUSED. The boundary is `msRemaining <= 60 * 60_000` (`:66`), so exactly 60 minutes and exactly zero are both AT_RISK; only a negative remainder is BREACHED (`:65`). The HIGH ticket was due 17:00; at 18:00 it shows PAUSED while PENDING and BREACHED the instant it reopens. `getSlaState` only *labels* the waiting period (`:57-58`); `slaDueAt` is stored once and recomputed only on a priority change (`ticketService.ts:208-211`). Really pausing needs a stored pause start (or accumulated paused time) and an update that pushes `slaDueAt` forward when the ticket leaves PENDING.
 
-`canAssignTicket` delegates to the same accepted set today, but it remains a separate name for validating assignment. `updateTicket` calls `canEditTicket(auth.role)` before `prisma.ticket.findFirst`; the route still parses JSON with Zod, and Zod owns priority enum validation. The service receives typed input and should not be described as the priority parser. A route-only gate would leave direct service callers unprotected.
+**Exercise 3.** The check passes because `canEditTicket` at `ticketService.ts:172` precedes the `findFirst` at `:176`, and `ticketIncludeForRole(auth.role)` is the include at `:108` and `:213`. The matrix:
 
-Exercise 3 solution: `ticketIncludeForRole(role)` preserves the customer, assigned-user, comment ordering, and author projection from `ticketInclude`, then sets `comments.where` to `visibleCommentWhere(role)`. That predicate is `{ visibility: "PUBLIC" }` for `VIEWER` and `{}` for each operational role. `getTicket` passes this include to `prisma.ticket.findFirst`; `updateTicket` passes the same role-aware include to `tx.ticket.update`. The original defect filtered GET while returning an unfiltered PATCH result. The repair makes response shaping a shared policy. `createTicket` has no new role gate in this increment; its existing route/service behavior stays outside the PATCH authorization change.
+| request and actor | status | audit rows | outbox rows | comments returned |
+| --- | --- | --- | --- | --- |
+| viewer PATCH `{ "priority": "URGENT" }` | 403 | 0 | 0 | none (error body) |
+| viewer PATCH `{}` | 403 | 0 | 0 | none (error body) |
+| agent PATCH `{ "priority": "URGENT" }` | 200 | +1 `ticket.updated` | +1 `ticket.updated` | PUBLIC and INTERNAL |
+| viewer GET | 200 | 0 | 0 | PUBLIC only |
 
-Here is the complete helper from `ticketService.ts`, using that file's existing
-`AuthContext` import and `ticketInclude` declaration:
+The first and third rows are what `tests/integration/ticket-patch.int.test.ts:53-66` asserts against real PostgreSQL when it is enabled.
 
-```ts
-export function visibleCommentWhere(role: AuthContext["role"]) {
-  return role === "VIEWER" ? { visibility: "PUBLIC" as const } : {};
-}
+**Exercise 4.** `assertTicketTransition` throws a plain `Error` (`index.ts:41`). `errorMiddleware` is not looking for that class, so it falls through to `res.status(500).json({ error: message })` (`errors.ts:32-33`): `500 {"error":"Cannot transition ticket from NEW to CLOSED"}`. A fix that keeps HTTP out of the domain: export a `TicketTransitionError extends Error` from the domain package and map it to 409 in `errorMiddleware`, or catch it in `updateTicket` and rethrow `new HttpError(409, error.message)`.
 
-function ticketIncludeForRole(role: AuthContext["role"]) {
-  return {
-    ...ticketInclude,
-    comments: {
-      where: visibleCommentWhere(role),
-      orderBy: { createdAt: "asc" as const },
-      include: { author: { select: { id: true, name: true, email: true, role: true } } }
-    }
-  };
-}
-```
+**Exercise 5.** Three places compute or set a ticket number: `createTicket` (`ticketService.ts:125-135`, Serializable with retry), the inbound-email route (`notificationRoutes.ts:33-43`, default isolation, no retry) and the seed (hard-coded 1001). Two simultaneous inbound emails both read the same highest number and both insert `N+1`. PostgreSQL's unique index on `@@unique([tenantId, number])` (`schema.prisma:125`) makes the second insert wait for the first and then fail with a unique violation; Prisma raises `P2002`, and the client gets a 500 while the first gets 202. `addTicketComment` runs at default isolation too, but it never computes a number.
 
-The complete read call is `prisma.ticket.findFirst({ where: { id, tenantId:
-auth.tenantId }, include: ticketIncludeForRole(auth.role) })`. In the existing
-transaction's `tx.ticket.update` call, keep its `where` and `data` unchanged
-and set `include: ticketIncludeForRole(auth.role)`. These are two distinct use
-sites: one shapes a read response, the other shapes the record returned by a
-successful write. The mocked tests inspect the generated Prisma query; they
-do not pretend that mocked empty comment arrays demonstrate actual database
-filtering. The viewer is rejected before the write use site is reachable.
+**Exercise 6.** The read is `ticketService.ts:176-179`; the transition is checked at `:183-185`; the transaction opens at `:199` and contains only the update and two inserts. Take a NEW ticket. Agent A sends `{"status":"RESOLVED"}` and agent B sends `{"status":"PENDING"}`; both read NEW, and both transitions are legal from NEW. If A commits first, B writes PENDING over RESOLVED, a move the table forbids (`index.ts:28`). Serializable does not help: either B's transaction starts after A commits and sees no conflict, or PostgreSQL raises `40001` and `withSerializableRetry` re-runs the callback, which repeats the unvalidated update. Fixes: move the read and `assertTicketTransition` inside the callback so a retry re-validates, or make the write conditional (`updateMany({ where: { id, tenantId, status: existing.status } })` and treat zero rows as 409).
 
-Exercise 4 solution: the operational path is `authorize -> tenant lookup -> domain checks -> begin serializable transaction -> update ticket -> AuditLog -> OutboxEvent -> commit -> response`. Validation happens before transaction writes. A validation error leaves the database unchanged and never creates audit or outbox rows. A transaction failure rolls back all durable writes made by that transaction. Here the important boundary is the Prisma commit: an outbox row is durable only after commit, and the worker can retry it. Sending a webhook before commit could expose a notification for a change that later rolls back.
+**Exercise 7.** As the viewer, `GET /api/admin/users` succeeds because that handler has no `requireRole` (`adminRoutes.ts:8-18`) and returns every user's email and role in the tenant. Send `x-user-email: <an ADMIN email>` to `GET /api/admin/audit-logs` and the gate at `:22` passes, because the role belongs to whichever row the header selects (`auth.ts:21-26`). Adding `requireRole(["ADMIN"])` to `/users` removes the enumeration step, but the seeded emails are guessable and listed in the web app (`apps/web/src/App.tsx:18`). The underlying problem is that identity is asserted, not proved.
 
-Exercise 5 mapped answer:
+## Senior review: what the course does not fix
 
-| Request and actor | Response | Ticket mutation | Audit | Outbox | Returned comments |
-| --- | --- | --- | --- | --- | --- |
-| Viewer PATCH `{ priority: "URGENT" }` | 403 | none | 0 | 0 | no PATCH body |
-| Viewer PATCH `{ tags: ["billing"] }` | 403 | none | 0 | 0 | no PATCH body |
-| Viewer PATCH `{}` | 403 | none | 0 | 0 | no PATCH body |
-| Agent PATCH `{ priority: "URGENT" }` | 200 | priority becomes URGENT | +1 `ticket.updated` | +1 event | PUBLIC and INTERNAL |
-| Viewer GET `/api/tickets/t1` | 200 | none | 0 | 0 | PUBLIC only |
+Each finding was checked against the current source; line numbers are for this commit.
 
-The staged `tests/api/ticket-service.test.ts` invokes the actual `getTicket` and `updateTicket` functions with a mocked Prisma module. It asserts the viewer 403 happens before lookup and `$transaction`, the agent lookup includes both `id: "ticket-1"` and `tenantId: "tenant-a"`, and viewer versus agent GET uses the two comment predicates. These are meaningful interaction checks, but they do not prove committed row counts or HTTP middleware behavior. A follow-up disposable PostgreSQL test should seed tenants A and B, send the same five requests, reopen a fresh client, and assert the matrix against durable AuditLog and OutboxEvent rows. Reviewers should also preserve the nullable `assignedUserId` wire contract in any future extension: omitted means unchanged, `null` means clear, and a non-null id must be tenant-scoped before mutation.
+**F1. Identity is a header, and the user directory is open (high, local-only by design).** `auth.ts:20-21` defaults both headers to seeded values, so a request with no headers is `agent@acme.test`. `/api/admin/users` (`adminRoutes.ts:8-18`) is the only admin route without a role gate. Together they turn any caller into any user. Acceptable for a teaching fixture; a deployment blocker.
+
+**F2. Client errors reported as 500, with raw messages (medium).** Invalid transitions (exercise 4) and any Prisma error both reach `errors.ts:32-33`, which echoes `error.message` to the client. Prisma messages include model and constraint names. Map known domain and Prisma codes (`P2002` → 409, `P2025` → 404) and return a generic body for the rest.
+
+**F3. Transition validated against a stale read (medium).** Exercise 6. A second consequence: the audit row stores `metadata: { before: existing, after: input }` (`ticketService.ts:223`), so under the race the "before" it records is not the state that was actually overwritten.
+
+**F4. The inbound-email route bypasses the ticket service (medium).** `notificationRoutes.ts:16-79` has no role gate (a VIEWER can create tickets), no audit row (unlike `createTicket`, `ticketService.ts:145-154`), and the number race of exercise 5. It is also not idempotent: `EmailMessage` has `@@unique([tenantId, externalId])` (`schema.prisma:160`), so a redelivered email fails with `P2002` → 500 instead of returning the ticket it already created, and the customer `upsert` (`notificationRoutes.ts:22-30`) runs outside the transaction. Route it through a service that looks up `externalId` first and reuses `createTicket`'s numbering and retry.
+
+**F5. SLA clock can be reset or ignored (medium, product).** Changing priority recomputes `slaDueAt` from *now* (`ticketService.ts:208-211`): an URGENT ticket about to breach can be set to LOW and back to URGENT to get a fresh two hours. PENDING time is never credited back (exercise 2). `resolvedAt` is set on RESOLVED (`:207`) but never cleared on reopen, so resolution-time reports would count a reopened ticket as resolved.
+
+**F6. Viewers count as first responders (low).** `addTicketComment` blocks only INTERNAL notes for viewers (`ticketService.ts:240-242`). A viewer's PUBLIC reply sets `firstResponseAt` (`:262-264`) and enqueues `notification.customer_reply` (`:277-284`), so a read-only user can satisfy the first-response metric and message the customer.
+
+**F7. The outbox worker has no claim step (medium once scaled).** `worker.ts:7-11` selects PENDING rows and `:15-18` marks each PROCESSING in a separate statement, so two worker processes take the same batch and deliver twice. A crash between `:15` and `:22` leaves a row in PROCESSING forever; FAILED rows are never retried, and `attempts` is incremented but never compared to a limit. Claim with `UPDATE ... WHERE status = 'PENDING' ... FOR UPDATE SKIP LOCKED` (raw SQL in Prisma) and add a lease timeout.
+
+**F8. Latent viewer no-op (low).** `canTransitionTicket` returns true for same-status moves before it checks for VIEWER (`index.ts:33-34`). It is unreachable through `updateTicket` today because `canEditTicket` runs first, but any new caller that relies on the domain function alone inherits it.

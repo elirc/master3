@@ -1,18 +1,39 @@
 # Testing and debugging
 
-The verification command is `npm run verify`, which runs TypeScript checking, Vitest, and the Vite production build. The current evidence was captured with `npm.cmd run verify` from the staged project and exited with code 0. The domain suite has nine passing tests. Those tests exercise pure workflow and role helpers without requiring PostgreSQL, while the build checks that the service’s Prisma include types and route imports remain valid.
+## What the suites contain (counted from source)
 
-Start with a regression table. For `{ priority: "URGENT" }` as `VIEWER`, expect 403, zero audit rows, zero outbox rows, and no ticket update. For `{}` as `VIEWER`, expect the same result; empty partial input must not become a write. For `{ priority: "URGENT" }` as `AGENT`, expect 200 and one `ticket.updated` audit plus outbox record. For a viewer GET, expect public comments and no `INTERNAL` comment. For an agent GET or successful agent PATCH, expect both visibility values. These assertions distinguish authorization, persistence, and response shaping.
+`npm test` runs `vitest run` with `include: ["tests/**/*.test.ts"]` (`vitest.config.ts:7`). That glob picks up three files:
 
-The staged verification has 14 tests: nine domain tests plus five service interaction tests. The service tests mock Prisma, invoke the real `getTicket` and `updateTicket` functions, and assert no lookup or transaction for each viewer PATCH shape, a tenant-scoped agent lookup, and the two comment predicates. They are bounded interaction evidence, not durable database or HTTP proof.
+| file | tests | needs a database? | proves |
+| --- | ---: | --- | --- |
+| `tests/domain/ticket-rules.test.ts` | 9 | no | transition, SLA and role helpers, including `canEditTicket` (`:52-57`) |
+| `tests/api/ticket-service.test.ts` | 8 (3 via `it.each` + 2 + 3) | no, Prisma is mocked at `:15` | viewer PATCH shapes stop before lookup and transaction (`:55-63`); agent path hits a tenant-scoped lookup, audit and outbox (`:65-88`); viewer vs agent comment predicates (`:90-106`); retry on `P2034` only (`:129-150`) |
+| `tests/integration/ticket-patch.int.test.ts` | 2 | yes, skipped unless `TEST_DATABASE_URL` is set (`:10`) | committed audit/outbox counts and the cross-tenant 404 against real PostgreSQL |
 
-When a test fails, identify its layer. A 401 indicates tenant or active-user lookup. A 403 on an agent indicates the role gate or fixture role. A 404 may mean the ticket belongs to a different tenant for an operational actor; a viewer PATCH should be 403 before lookup. A 200 response with an internal viewer comment indicates the wrong include was used. A ticket change without matching audit and outbox rows indicates a transaction boundary problem. A passing GET test does not prove PATCH output is safe; exercise each route that embeds a ticket.
+So a plain run reports 17 passing and 2 skipped. The integration file's header comment (`:3-7`) gives the disposable-database recipe; never point `TEST_DATABASE_URL` at a database you care about, because the test creates and deletes tenants.
 
-The domain test in [ticket-rules.test.ts](../tests/domain/ticket-rules.test.ts) proves `canEditTicket("VIEWER")` is false and operational roles are true. It also retains the assignment and internal-note tests, so the repair does not weaken existing policy. A future PostgreSQL integration fixture should seed two tenants, four roles, one ticket, one public comment, and one internal note, then inspect durable counts before and after forbidden requests. Keep that fixture disposable and never point it at a user database.
+## What each layer can and cannot prove
+
+The mocked service tests check call order and query shape. Their `$transaction` mock just invokes the callback (`ticket-service.test.ts:47-52`), so they cannot show rollback, locking or a real serialization failure; the retry tests inject a fake `P2034` instead. Nothing tests HTTP at all: `authMiddleware`, `errorMiddleware` and the Zod parse in the routes are exercised only by hand. The worker, the inbound-email route, customers and admin have no tests.
+
+## Reading a failure by its status code
+
+| you see | look at |
+| --- | --- |
+| 401 | `auth.ts:23-31`: wrong slug, unknown email, or `active: false` |
+| 400 with `issues` | Zod in the route (`errors.ts:22-24`); the service never ran |
+| 403 for an agent | `canEditTicket` / `canAssignTicket`, or the seeded role |
+| 404 for an agent | tenant predicate: the id belongs to another tenant or does not exist |
+| 500 "Cannot transition ticket from X to Y" | `assertTicketTransition` threw a plain `Error` (domain `index.ts:41`); this is a client mistake reported as a server fault (06, F2) |
+| 500 mentioning `Unique constraint` | `P2002`: duplicate ticket number or email `externalId` (06, F4) |
+| 200 with an INTERNAL comment for a viewer | an include that bypasses `ticketIncludeForRole` |
+| ticket changed but no audit row | a write outside the transaction |
+
+A passing GET test does not prove that PATCH output is safe; check every route that returns a ticket.
 
 ## The domain test that pins the role gate
 
-This is the case referred to below, from `tests/domain/ticket-rules.test.ts:52`. It runs with no database at all, which is why it belongs in the domain suite rather than behind a Postgres fixture.
+From `tests/domain/ticket-rules.test.ts:52-57`. It needs no database, which is why it belongs in the domain suite:
 
 ```ts
   it("allows ticket edits only for operational roles", () => {
@@ -23,3 +44,12 @@ This is the case referred to below, from `tests/domain/ticket-rules.test.ts:52`.
   });
 ```
 
+## Dependency-free checks
+
+The domain package has no imports, so Node 22.6+ can load it directly with type stripping. From the repo root, with no `npm install`:
+
+```bash
+node --experimental-strip-types --test path/to/your-check.test.mjs
+```
+
+Inside the check, import the domain with `await import(pathToFileURL(process.cwd() + "/packages/domain/src/index.ts").href)`. The service cannot be loaded this way (it imports `@prisma/client` and path aliases), so the practice checks for service code read the source text instead. [05-PRACTICE.md](05-PRACTICE.md) uses both styles.

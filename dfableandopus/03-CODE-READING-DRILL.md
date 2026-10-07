@@ -163,9 +163,9 @@ What is sound here, what is not, and how would you describe it in an interview?
 <details>
 <summary>Answer</summary>
 
-Sound: the role and the tenant id both come from the stored user row, not from the request, so nothing a caller sends can raise their privileges. The join requires the user to belong to that tenant slug and to be `active`, so a deactivated account or a mismatched pairing is a 401, and the resulting `AuthContext` is the only thing downstream code trusts.
+Sound: the role and the tenant id both come from the stored user row, not from the request, so a caller cannot send a role directly (though, as below, they can pick which user row is selected, and `/api/admin/users` at `adminRoutes.ts:8-18` lists every email and role without a role gate). The join requires the user to belong to that tenant slug and to be `active`, so a deactivated account or a mismatched pairing is a 401, and the resulting `AuthContext` is the only thing downstream code trusts.
 
-Not sound: there is no authentication. The email header is an unverified identity claim, and both headers default to seeded values, so a request with no headers at all resolves to a real agent in a real tenant. That is fine as a local teaching fixture and catastrophic if deployed, which is why the course README calls it out in its first paragraph.
+Not sound: there is no authentication. The email header is an unverified identity claim, and both headers default to seeded values, so a request with no headers at all resolves to a real agent in a real tenant. That is fine as a local teaching fixture and catastrophic if deployed, which is why the course README calls it out in its opening section.
 
 How to describe it: "tenant scoping in this codebase is real and tested, and the identity that selects the tenant is a demo shim. Replacing it is a session or token check in front of this middleware; everything after it, including every `tenantId` predicate in the service, is unchanged." That answer shows you know which half is the design and which half is the fixture. The service tests never exercise this function at all, since they call the service directly with a hand-built context (`tests/api/ticket-service.test.ts:19-31`).
 </details>

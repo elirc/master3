@@ -1,31 +1,38 @@
 # Trace lab
 
-Trace A, forbidden viewer PATCH. The client sends `PATCH /api/tickets/t1` with `{ "priority": "URGENT" }`, `x-tenant-slug: acme-support`, and `x-user-email: viewer@acme.test`. Express routes to the ticket router. Auth queries an active user and stores tenant and role on `req.auth`. Zod parses the priority. The service enters `updateTicket`, calls `canEditTicket("VIEWER")`, and throws a 403 before its ticket query. Prisma performs no ticket read, update, audit insert, or outbox insert. The error middleware serializes `{ error: ... }`.
+For each trace, record: actor, tenant, input, first query, durable writes, response, visible comments. `$id` is the cuid of seeded ticket #1001 (get it from `GET /api/tickets` as the agent; the seed prints only the number, `prisma/seed.ts:102`).
 
-Trace B, operational PATCH. An agent sends `{ "tags": ["billing"] }`. Auth produces the same tenant and `AGENT` role. The role gate passes. The service selects the ticket with both id and tenant id, validates any supplied assignee or status, then opens the serializable transaction. Prisma updates tags, inserts `AuditLog(action="ticket.updated")`, inserts an `OutboxEvent(topic="ticket.updated")`, and commits. The service’s include is `ticketIncludeForRole("AGENT")`, so the 200 response includes the operational comment set and enriched SLA state.
+**Trace A, forbidden viewer PATCH.** `PATCH /api/tickets/$id`, `{ "priority": "URGENT" }`, `x-tenant-slug: acme-support`, `x-user-email: viewer@acme.test`. `authMiddleware` reads the active user (`auth.ts:23-26`); the route's Zod parse accepts (`ticketRoutes.ts:34`); `updateTicket` calls `canEditTicket("VIEWER")` and throws 403 (`ticketService.ts:172-174`). First query: the auth lookup only. Writes: none. Response: `403 {"error":"You do not have permission to update tickets"}`.
 
-Trace C, viewer GET. The viewer sends `GET /api/tickets/t1`. `getTicket` uses `ticketIncludeForRole("VIEWER")`; its comments predicate is `visibility = PUBLIC`. The ticket and customer are returned, the public comment remains, and the internal note is absent. This is the same policy shape used by the update include, even though a viewer cannot currently reach update. Keeping one helper prevents the two response paths from drifting again.
+**Trace B, operational PATCH.** Same request as the agent with `{ "tags": ["billing"] }`. The gate passes; `findFirst` with `{ id, tenantId }` (`:176-179`); no status or assignee to validate; the serializable transaction updates tags, inserts `AuditLog(action="ticket.updated")` and `OutboxEvent(topic="ticket.updated")` (`:199-233`). `slaDueAt` is untouched because priority did not change. Response: 200 with both comments and `slaState`.
 
-Trace D, cross-tenant id. For an operational actor, a valid ticket id from tenant B is sent with tenant A headers. The service's `findFirst` includes `tenantId: auth.tenantId`, so it returns no row and throws 404. The client cannot infer whether the id exists in another tenant. For a `VIEWER`, the new role gate runs first and returns 403 before any lookup; do not describe that case as a cross-tenant 404. Record each trace as actor, tenant, input, first query, durable writes, response, and visible comments. Compare the ledger with [03-WORKED-CHANGE.md](03-WORKED-CHANGE.md) and inspect [schema.prisma](../prisma/schema.prisma) for the foreign-key context.
+**Trace C, viewer GET.** `getTicket` uses `ticketIncludeForRole("VIEWER")` (`:105-113`), whose comment predicate is `visibility = PUBLIC`. Response: 200 with the manager's public reply, without the agent's internal note.
 
-## Where traces A, B and D diverge
+**Trace D, cross-tenant id.** An agent of `acme-support` sends an id belonging to another tenant. `findFirst` includes `tenantId: auth.tenantId`, finds nothing, throws 404 (`:181`). A *viewer* sending the same id gets 403 from the gate before any lookup; do not describe that as a cross-tenant 404.
 
-All three traces enter the same function, `apps/api/src/modules/tickets/ticketService.ts:168`. The role gate runs before the lookup (trace A stops here with 403), and the lookup is tenant-scoped (trace D gets 404 for another tenant's id).
+**Trace E, invalid transition.** The agent sends `{ "status": "CLOSED" }` on an OPEN ticket. `assertTicketTransition` (`packages/domain/src/index.ts:39-43`) throws a plain `Error` because AGENT may close only from RESOLVED or PENDING (`:35`). `errorMiddleware` falls through to 500 (`errors.ts:32-33`). Writes: none. Response: `500 {"error":"Cannot transition ticket from OPEN to CLOSED"}`. Same request as the manager: 200.
+
+**Trace F, inbound email as a viewer.** `POST /api/notifications/inbound-email` with `{ "externalId": "m-1", "fromEmail": "new@example.com", "subject": "Hi", "body": "Help" }` as `viewer@acme.test`. No role check runs (`notificationRoutes.ts:16-20`). The customer is upserted outside the transaction (`:22-30`); inside, the route computes the next number, creates the ticket, the `EmailMessage` and an `OutboxEvent(topic="ticket.email_ingested")` (`:32-75`). No audit row. Response: 202. Send the identical body again: the customer upsert is a no-op, then the `EmailMessage` insert hits `@@unique([tenantId, externalId])` and the transaction rolls back. Response: 500 (finding F4).
+
+## Where traces A, B, D and E diverge
+
+All four enter `updateTicket` (`apps/api/src/modules/tickets/ticketService.ts:168`):
 
 ```ts
-export async function updateTicket(auth: AuthContext, id: string, input: UpdateTicketInput) {
-  // Ticket edits are an operational action. Keep this check before the lookup
-  // so a viewer cannot trigger a database read, audit row, or outbox event by
-  // sending a partial or empty PATCH.
-  if (!canEditTicket(auth.role)) {
+  if (!canEditTicket(auth.role)) {                       // A stops here: 403
     throw new HttpError(403, "You do not have permission to update tickets");
   }
 
   const existing = await prisma.ticket.findFirst({
-    where: { id, tenantId: auth.tenantId },
+    where: { id, tenantId: auth.tenantId },              // D misses here
     select: { id: true, status: true, priority: true, assignedUserId: true }
   });
 
-  if (!existing) throw new HttpError(404, "Ticket not found");
+  if (!existing) throw new HttpError(404, "Ticket not found");   // D: 404
+
+  if (input.status) {
+    assertTicketTransition({ from: existing.status, to: input.status, actorRole: auth.role }); // E: 500
+  }
 ```
 
+B is the only one to reach the transaction at `:199`.
